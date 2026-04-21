@@ -28,5 +28,26 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+datasets\
+dataset\
+*.png
+
 # 你的本地 IDE 配置 (例如 VS Code)
 .vscode/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 模型权重、检查点
+*.pt
+*.pth
+*.ckpt
+outputs_phase1/
+*.pyc
+# 数据集和压缩包
+datasets/
+*.zip
+
+# 日志和表格
+*.csv

@@ -40,4 +40,23 @@ else:
 
 # --- 第 2 件事：UFD score 的方向 ---
 # 这个需要你传入一张真实的 Fake 图像和一张真实的 Real 图像来 print(score) 观察
+print("\n--- 开始验证第 2 件事：Score 方向 ---")
+# 这里直接打印刚才随机噪声 x 的 score，看看它是正负数还是 0~1 的概率值
+print("当前输入的 Score:", score.item())
+# 建议：后续传入真实的 Fake 图和 Real 图，对比 print 的分数大小
 
+print("\n--- 开始验证第 3 件事：Checkpoint 类型 ---")
+path = "/root/autodl-tmp/projects/UniversalFakeDetect/pretrained_weights/fc_weights.pth"  # 请在这里填入你真实的权重文件路径
+try:
+    obj = torch.load(path, map_location="cpu")
+    print("加载成功！")
+    print("Checkpoint 数据类型:", type(obj))
+    
+    if isinstance(obj, dict):
+        print("💡 结论：这是一个字典，你需要用 model.load_state_dict() 来加载它。")
+        # 可以顺便看看字典里有哪些 key
+        print("字典的 keys:", list(obj.keys())[:5], "...") 
+    else:
+        print("💡 结论：这似乎是一个完整的网络模型对象 (nn.Module)。")
+except Exception as e:
+    print("加载失败，错误信息:", e)

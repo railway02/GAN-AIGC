@@ -2,6 +2,7 @@
 import os
 import csv
 import math
+import sys
 import argparse
 from pathlib import Path
 from typing import List, Tuple
@@ -13,12 +14,39 @@ from torchvision import transforms
 from torchvision.utils import save_image
 from PIL import Image
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from models import get_model
 from detector_wrapper import FrozenDetectorScorer
 from generator import ResidualUNet
 from losses import phase1_loss
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+ARCH_ALIASES = {
+    "res18": "Imagenet:resnet18",
+    "res34": "Imagenet:resnet34",
+    "res50": "Imagenet:resnet50",
+    "res101": "Imagenet:resnet101",
+    "res152": "Imagenet:resnet152",
+    "resnet18": "Imagenet:resnet18",
+    "resnet34": "Imagenet:resnet34",
+    "resnet50": "Imagenet:resnet50",
+    "resnet101": "Imagenet:resnet101",
+    "resnet152": "Imagenet:resnet152",
+    "vit_b_16": "Imagenet:vit_b_16",
+    "vit_b_32": "Imagenet:vit_b_32",
+    "vit_l_16": "Imagenet:vit_l_16",
+    "vit_l_32": "Imagenet:vit_l_32",
+    "clip_rn50": "CLIP:RN50",
+    "clip_rn101": "CLIP:RN101",
+    "clip_vitb16": "CLIP:ViT-B/16",
+    "clip_vitb32": "CLIP:ViT-B/32",
+    "clip_vitl14": "CLIP:ViT-L/14",
+    "clip_vitl14_336": "CLIP:ViT-L/14@336px",
+}
 
 
 class SimpleImageFolder(Dataset):
@@ -56,42 +84,64 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
+def normalize_detector_arch(arch: str) -> str:
+    arch = arch.strip()
+    return ARCH_ALIASES.get(arch, arch)
+
+
+def strip_state_dict_prefix(state_dict, prefixes=("module.", "model.")):
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in prefixes:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+        cleaned[new_key] = value
+    return cleaned
+
+
 def build_detector_from_ufd(args, device: torch.device) -> FrozenDetectorScorer:
-    """
-    Replace ONLY this function with your actual UniversalFakeDetect model loading code.
-
-    Goal:
-    - return a FrozenDetectorScorer(raw_detector, ...)
-    - raw_detector must be a torch.nn.Module
-    - raw_detector(x) should produce a tensor/dict/tuple from which a fake/AI score can be extracted
-
-    Two common ways:
-
-    Option A: checkpoint already stores a full nn.Module
-        raw_detector = torch.load(args.detector_ckpt, map_location="cpu")
-
-    Option B: checkpoint stores state_dict only
-        raw_detector = build_model_from_ufd_code(...)
-        state = torch.load(args.detector_ckpt, map_location="cpu")
-        raw_detector.load_state_dict(state)
-
-    IMPORTANT:
-    - raw_detector must stay differentiable wrt input
-    - do NOT wrap its forward with torch.no_grad()
-    """
-
-    # ======== START: replace this block with your actual UFD code ========
+    detector_arch = normalize_detector_arch(args.detector_arch)
     obj = torch.load(args.detector_ckpt, map_location="cpu")
+
     if isinstance(obj, nn.Module):
         raw_detector = obj
-    elif isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], nn.Module):
-        raw_detector = obj["model"]
     else:
-        raise RuntimeError(
-            "Please edit build_detector_from_ufd() to match your UniversalFakeDetect repo.\n"
-            "Right now, train.py only supports checkpoints that directly contain an nn.Module."
-        )
-    # ======== END ========
+        raw_detector = get_model(detector_arch)
+
+        if not isinstance(obj, dict):
+            raise RuntimeError(
+                f"Unsupported checkpoint type: {type(obj)}. "
+                "Expected either an nn.Module or a state_dict-like dict."
+            )
+
+        load_ok = False
+        if "model" in obj and isinstance(obj["model"], nn.Module):
+            raw_detector = obj["model"]
+            load_ok = True
+        elif "model" in obj and isinstance(obj["model"], dict):
+            raw_detector.load_state_dict(strip_state_dict_prefix(obj["model"]), strict=True)
+            load_ok = True
+        elif "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            raw_detector.load_state_dict(strip_state_dict_prefix(obj["state_dict"]), strict=True)
+            load_ok = True
+        elif {"weight", "bias"}.issubset(obj.keys()):
+            raw_detector.fc.load_state_dict(obj, strict=True)
+            load_ok = True
+        elif all(isinstance(k, str) for k in obj.keys()):
+            cleaned_state = strip_state_dict_prefix(obj)
+            if any(k.startswith("fc.") for k in cleaned_state):
+                raw_detector.load_state_dict(cleaned_state, strict=True)
+            else:
+                raw_detector.fc.load_state_dict(cleaned_state, strict=True)
+            load_ok = True
+
+        if not load_ok:
+            raise RuntimeError(
+                "Could not infer how to load the detector checkpoint. "
+                "Supported formats: full nn.Module, {'model': state_dict}, "
+                "{'state_dict': state_dict}, full model state_dict, or fc-only state_dict."
+            )
 
     raw_detector = raw_detector.to(device).eval()
 
@@ -255,6 +305,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./outputs")
 
     parser.add_argument("--detector_ckpt", type=str, required=True)
+    parser.add_argument("--detector_arch", type=str, default="CLIP:ViT-L/14")
     parser.add_argument("--detector_input_size", type=int, default=224)
     parser.add_argument("--fake_index", type=int, default=1)
 
@@ -291,7 +342,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -299,7 +351,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
         drop_last=False,
     )
 
